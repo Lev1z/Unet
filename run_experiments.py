@@ -191,6 +191,26 @@ class PlainRestorationCNN(nn.Module):
         return self.net(x)
 
 
+class ResidualUNetRestoration(nn.Module):
+    outputs_image = True
+
+    def __init__(self, base: int = 16, residual_scale: float = 0.5):
+        super().__init__()
+        self.core = UNetSmall(out_channels=3, base=base)
+        self.residual_scale = residual_scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = torch.tanh(self.core(x)) * self.residual_scale
+        return (x + residual).clamp(0, 1)
+
+
+def predict_restoration(model: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+    outputs = model(inputs)
+    if getattr(model, "outputs_image", False):
+        return outputs.clamp(0, 1)
+    return torch.sigmoid(outputs).clamp(0, 1)
+
+
 def train_model(
     model: nn.Module,
     loader: DataLoader,
@@ -221,7 +241,8 @@ def train_model(
                 )
                 loss = 0.5 * bce_loss(outputs, targets) + (1 - dice.mean())
             else:
-                loss = mse_loss(torch.sigmoid(outputs), targets)
+                preds = outputs.clamp(0, 1) if getattr(model, "outputs_image", False) else torch.sigmoid(outputs)
+                loss = mse_loss(preds, targets)
             loss.backward()
             optimizer.step()
             total_loss += float(loss.item()) * inputs.size(0)
@@ -240,7 +261,8 @@ def train_model(
                     )
                     loss = 0.5 * bce_loss(outputs, targets) + (1 - dice.mean())
                 else:
-                    loss = mse_loss(torch.sigmoid(outputs), targets)
+                    preds = outputs.clamp(0, 1) if getattr(model, "outputs_image", False) else torch.sigmoid(outputs)
+                    loss = mse_loss(preds, targets)
                 val_loss += float(loss.item()) * inputs.size(0)
         history.append(
             {
@@ -280,7 +302,7 @@ def evaluate_restoration(model: nn.Module, loader: DataLoader, device: torch.dev
     with torch.no_grad():
         for inputs, targets in loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            preds = torch.sigmoid(model(inputs)).clamp(0, 1)
+            preds = predict_restoration(model, inputs)
             for pred, target in zip(preds.cpu(), targets.cpu()):
                 pred_np = pred.numpy().transpose(1, 2, 0)
                 target_np = target.numpy().transpose(1, 2, 0)
@@ -381,15 +403,15 @@ def save_restoration_examples(
         degraded, clean = dataset[row]
         with torch.no_grad():
             preds = {
-                name: torch.sigmoid(model(degraded.unsqueeze(0).to(device))).squeeze(0).cpu()
+                name: predict_restoration(model, degraded.unsqueeze(0).to(device)).squeeze(0).cpu()
                 for name, model in models.items()
             }
         axes[row, 0].imshow(tensor_to_image(degraded))
         axes[row, 0].set_title("Degraded")
         axes[row, 1].imshow(tensor_to_image(clean))
         axes[row, 1].set_title("Ground Truth")
-        axes[row, 2].imshow(tensor_to_image(preds["U-Net"]))
-        axes[row, 2].set_title("U-Net")
+        axes[row, 2].imshow(tensor_to_image(preds["Residual U-Net"]))
+        axes[row, 2].set_title("Residual U-Net")
         axes[row, 3].imshow(tensor_to_image(preds["Plain CNN"]))
         axes[row, 3].set_title("Plain CNN")
         for col in range(4):
@@ -417,11 +439,11 @@ def save_history_plot(histories: dict[str, list[dict[str, float]]], out_path: Pa
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="U-Net segmentation and restoration experiments")
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--size", type=int, default=64)
-    parser.add_argument("--train-count", type=int, default=256)
-    parser.add_argument("--val-count", type=int, default=64)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--train-count", type=int, default=1024)
+    parser.add_argument("--val-count", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     args = parser.parse_args()
@@ -462,7 +484,7 @@ def main() -> None:
         }
 
     restore_models = {
-        "U-Net": UNetSmall(out_channels=3),
+        "Residual U-Net": ResidualUNetRestoration(),
         "Plain CNN": PlainRestorationCNN(),
     }
     results["restoration"]["Degraded input"] = evaluate_restoration_input(restore_val_loader)
