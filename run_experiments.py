@@ -2,6 +2,7 @@ import argparse
 import json
 import math
 import random
+import copy
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -11,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFilter
 from skimage.metrics import structural_similarity
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torchvision.datasets import OxfordIIITPet
 from tqdm import tqdm
 
 
@@ -23,6 +25,19 @@ def set_seed(seed: int) -> None:
 
 def np_to_tensor(image: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(image.transpose(2, 0, 1)).float()
+
+
+def image_to_array(image: Image.Image, size: int) -> np.ndarray:
+    image = image.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
+    return np.asarray(image).astype(np.float32) / 255.0
+
+
+def trimap_to_mask(mask: Image.Image, size: int) -> np.ndarray:
+    mask = mask.resize((size, size), Image.Resampling.NEAREST)
+    mask_np = np.asarray(mask)
+    # Oxford-IIIT Pet trimap labels: 1=pet, 2=background, 3=border/uncertain.
+    # For application-style foreground extraction, pet + boundary is foreground.
+    return (mask_np != 2).astype(np.float32)[..., None]
 
 
 def draw_scene(seed: int, size: int = 64) -> tuple[np.ndarray, np.ndarray]:
@@ -114,6 +129,49 @@ class SyntheticRestorationDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         return self.samples[idx]
+
+
+class PetSegmentationDataset(Dataset):
+    def __init__(self, root: Path, split: str, count: int, size: int):
+        self.dataset = OxfordIIITPet(
+            root=str(root),
+            split=split,
+            target_types="segmentation",
+            download=True,
+        )
+        self.count = min(count, len(self.dataset))
+        self.size = size
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        image, mask = self.dataset[idx]
+        image_np = image_to_array(image, self.size)
+        mask_np = trimap_to_mask(mask, self.size)
+        return np_to_tensor(image_np), torch.from_numpy(mask_np.transpose(2, 0, 1)).float()
+
+
+class PetRestorationDataset(Dataset):
+    def __init__(self, root: Path, split: str, count: int, size: int, seed_offset: int):
+        self.dataset = OxfordIIITPet(
+            root=str(root),
+            split=split,
+            target_types="segmentation",
+            download=True,
+        )
+        self.count = min(count, len(self.dataset))
+        self.size = size
+        self.seed_offset = seed_offset
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        image, _ = self.dataset[idx]
+        clean = image_to_array(image, self.size)
+        degraded = degrade_image(clean, self.seed_offset + idx)
+        return np_to_tensor(degraded), np_to_tensor(clean)
 
 
 class DoubleConv(nn.Module):
@@ -225,6 +283,8 @@ def train_model(
     bce_loss = nn.BCEWithLogitsLoss()
     mse_loss = nn.MSELoss()
     history = []
+    best_val_loss = float("inf")
+    best_state = copy.deepcopy(model.state_dict())
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -264,13 +324,18 @@ def train_model(
                     preds = outputs.clamp(0, 1) if getattr(model, "outputs_image", False) else torch.sigmoid(outputs)
                     loss = mse_loss(preds, targets)
                 val_loss += float(loss.item()) * inputs.size(0)
+        mean_val_loss = val_loss / len(val_loader.dataset)
+        if mean_val_loss < best_val_loss:
+            best_val_loss = mean_val_loss
+            best_state = copy.deepcopy(model.state_dict())
         history.append(
             {
                 "epoch": epoch,
                 "train_loss": total_loss / len(loader.dataset),
-                "val_loss": val_loss / len(val_loader.dataset),
+                "val_loss": mean_val_loss,
             }
         )
+    model.load_state_dict(best_state)
     return history
 
 
@@ -439,25 +504,35 @@ def save_history_plot(histories: dict[str, list[dict[str, float]]], out_path: Pa
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="U-Net segmentation and restoration experiments")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--size", type=int, default=64)
-    parser.add_argument("--train-count", type=int, default=1024)
+    parser.add_argument("--dataset", choices=["synthetic", "pet"], default="pet")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--size", type=int, default=96)
+    parser.add_argument("--train-count", type=int, default=512)
     parser.add_argument("--val-count", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
+    parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
     set_seed(args.seed)
+    if args.output_dir is None:
+        args.output_dir = Path("outputs_pet" if args.dataset == "pet" else "outputs")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = args.output_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    seg_train = SyntheticSegmentationDataset(args.train_count, args.size, 0)
-    seg_val = SyntheticSegmentationDataset(args.val_count, args.size, 10_000)
-    restore_train = SyntheticRestorationDataset(args.train_count, args.size, 20_000)
-    restore_val = SyntheticRestorationDataset(args.val_count, args.size, 30_000)
+    if args.dataset == "pet":
+        seg_train = PetSegmentationDataset(args.data_dir, "trainval", args.train_count, args.size)
+        seg_val = PetSegmentationDataset(args.data_dir, "test", args.val_count, args.size)
+        restore_train = PetRestorationDataset(args.data_dir, "trainval", args.train_count, args.size, 20_000)
+        restore_val = PetRestorationDataset(args.data_dir, "test", args.val_count, args.size, 30_000)
+    else:
+        seg_train = SyntheticSegmentationDataset(args.train_count, args.size, 0)
+        seg_val = SyntheticSegmentationDataset(args.val_count, args.size, 10_000)
+        restore_train = SyntheticRestorationDataset(args.train_count, args.size, 20_000)
+        restore_val = SyntheticRestorationDataset(args.val_count, args.size, 30_000)
 
     seg_train_loader = DataLoader(seg_train, batch_size=args.batch_size, shuffle=True)
     seg_val_loader = DataLoader(seg_val, batch_size=args.batch_size)
@@ -465,7 +540,11 @@ def main() -> None:
     restore_val_loader = DataLoader(restore_val, batch_size=args.batch_size)
 
     results = {
-        "config": vars(args) | {"output_dir": str(args.output_dir), "device": str(device)},
+        "config": vars(args) | {
+            "data_dir": str(args.data_dir),
+            "output_dir": str(args.output_dir),
+            "device": str(device),
+        },
         "segmentation": {},
         "restoration": {},
     }
