@@ -1,7 +1,6 @@
 import argparse
 import copy
 import json
-import math
 import random
 import tarfile
 import urllib.request
@@ -10,8 +9,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFilter
-from skimage.metrics import structural_similarity
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -249,18 +247,6 @@ def draw_road_scene(seed: int, size: int) -> tuple[np.ndarray, np.ndarray]:
     return arr, np.asarray(mask).astype(np.int64)
 
 
-def degrade_image(clean: np.ndarray, seed: int) -> np.ndarray:
-    rng = np.random.default_rng(seed + 100_000)
-    size = clean.shape[0]
-    img = Image.fromarray((clean * 255).astype(np.uint8), mode="RGB")
-    down = int(rng.integers(max(24, size // 2), max(25, int(size * 0.72))))
-    img = img.resize((down, down), Image.Resampling.BICUBIC).resize((size, size), Image.Resampling.BICUBIC)
-    img = img.filter(ImageFilter.GaussianBlur(radius=float(rng.uniform(0.45, 1.1))))
-    arr = np.asarray(img).astype(np.float32) / 255.0
-    arr += rng.normal(0, float(rng.uniform(0.01, 0.028)), arr.shape).astype(np.float32)
-    return np.clip(arr, 0, 1)
-
-
 class RoadSegmentationDataset(Dataset):
     def __init__(self, count: int, size: int, seed_offset: int):
         self.samples = []
@@ -275,8 +261,8 @@ class RoadSegmentationDataset(Dataset):
         return self.samples[idx]
 
 
-class RoadRestorationDataset(Dataset):
-    def __init__(self, count: int, size: int, seed_offset: int, img_dir: Path, fallback_sources: list[np.ndarray] | None = None):
+class VisualRestorationDataset(Dataset):
+    def __init__(self, size: int, img_dir: Path, fallback_sources: list[np.ndarray] | None = None):
         self.samples = []
         sources = load_img_sources(img_dir, size)
         self.source_type = "img" if sources else "camvid_images"
@@ -285,17 +271,27 @@ class RoadRestorationDataset(Dataset):
         if not sources:
             self.source_type = "generated_road_placeholder"
             sources = [draw_road_scene(90_000 + idx, size)[0] for idx in range(3)]
-        for idx in range(count):
-            clean = sources[idx % len(sources)].copy()
-            degraded = degrade_image(clean, seed_offset + idx)
-            self.samples.append((np_to_tensor(degraded), np_to_tensor(clean)))
+        for source in sources[:3]:
+            enhanced = enhance_for_visual_restoration(source)
+            self.samples.append((source, enhanced))
         self.source_count = len(sources)
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
         return self.samples[idx]
+
+
+def enhance_for_visual_restoration(image: np.ndarray) -> np.ndarray:
+    pil = Image.fromarray((image * 255).astype(np.uint8), mode="RGB")
+    pil = pil.resize((pil.width * 2, pil.height * 2), Image.Resampling.LANCZOS)
+    pil = ImageOps.autocontrast(pil, cutoff=1)
+    pil = pil.filter(ImageFilter.MedianFilter(size=3))
+    pil = ImageEnhance.Contrast(pil).enhance(1.18)
+    pil = pil.filter(ImageFilter.UnsharpMask(radius=1.1, percent=185, threshold=2))
+    pil = ImageEnhance.Sharpness(pil).enhance(1.25)
+    return np.asarray(pil).astype(np.float32) / 255.0
 
 
 def load_img_sources(img_dir: Path, size: int) -> list[np.ndarray]:
@@ -305,7 +301,7 @@ def load_img_sources(img_dir: Path, size: int) -> list[np.ndarray]:
     for path in sorted(img_dir.iterdir()):
         if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
             continue
-        image = Image.open(path).convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
+        image = Image.open(path).convert("RGB").resize((size, size), Image.Resampling.LANCZOS)
         images.append(np.asarray(image).astype(np.float32) / 255.0)
     return images[:3]
 
@@ -368,43 +364,6 @@ class FCNSmall(nn.Module):
         return self.net(x)
 
 
-class PlainRestorationCNN(nn.Module):
-    def __init__(self, width: int = 32):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, width, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(width, width, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(width, width, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(width, 3, 3, padding=1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class RestorationUNet(nn.Module):
-    outputs_image = True
-
-    def __init__(self, base: int = 16, residual_scale: float = 0.35):
-        super().__init__()
-        self.core = UNetSmall(out_channels=3, base=base)
-        self.residual_scale = residual_scale
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = torch.tanh(self.core(x)) * self.residual_scale
-        return (x + residual).clamp(0, 1)
-
-
-def predict_restoration(model: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
-    outputs = model(inputs)
-    if getattr(model, "outputs_image", False):
-        return outputs.clamp(0, 1)
-    return torch.sigmoid(outputs).clamp(0, 1)
-
-
 def count_parameters(model: nn.Module) -> int:
     return sum(param.numel() for param in model.parameters() if param.requires_grad)
 
@@ -459,39 +418,6 @@ def train_segmentation(
     return history
 
 
-def train_restoration(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, epochs: int, device: torch.device) -> list[dict[str, float]]:
-    model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.MSELoss()
-    history = []
-    best_state = copy.deepcopy(model.state_dict())
-    best_val_loss = float("inf")
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total = 0.0
-        for inputs, targets in tqdm(train_loader, desc=f"restoration epoch {epoch}/{epochs}", leave=False):
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            preds = predict_restoration(model, inputs)
-            loss = criterion(preds, targets)
-            loss.backward()
-            optimizer.step()
-            total += float(loss.item()) * inputs.size(0)
-        val_total = 0.0
-        model.eval()
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                val_total += float(criterion(predict_restoration(model, inputs), targets).item()) * inputs.size(0)
-        val_loss = val_total / len(val_loader.dataset)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = copy.deepcopy(model.state_dict())
-        history.append({"epoch": epoch, "train_loss": total / len(train_loader.dataset), "val_loss": val_loss})
-    model.load_state_dict(best_state)
-    return history
-
-
 def evaluate_segmentation(model: nn.Module, loader: DataLoader, device: torch.device) -> dict[str, object]:
     model.eval()
     intersections = np.zeros(len(CLASS_NAMES), dtype=np.float64)
@@ -517,36 +443,6 @@ def evaluate_segmentation(model: nn.Module, loader: DataLoader, device: torch.de
         "pixel_accuracy": float(pixel_correct / pixel_total),
         "class_iou": {name: float(ious[idx]) for idx, name in enumerate(CLASS_NAMES)},
     }
-
-
-def evaluate_restoration(model: nn.Module, loader: DataLoader, device: torch.device) -> dict[str, float]:
-    model.eval()
-    mses, psnrs, ssims = [], [], []
-    with torch.no_grad():
-        for inputs, targets in loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            preds = predict_restoration(model, inputs)
-            for pred, target in zip(preds.cpu(), targets.cpu()):
-                pred_np = pred.numpy().transpose(1, 2, 0)
-                target_np = target.numpy().transpose(1, 2, 0)
-                mse = float(np.mean((pred_np - target_np) ** 2))
-                mses.append(mse)
-                psnrs.append(float(20 * math.log10(1.0 / math.sqrt(max(mse, 1e-12)))))
-                ssims.append(float(structural_similarity(target_np, pred_np, data_range=1.0, channel_axis=2)))
-    return {"mse": float(np.mean(mses)), "psnr": float(np.mean(psnrs)), "ssim": float(np.mean(ssims))}
-
-
-def evaluate_restoration_input(loader: DataLoader) -> dict[str, float]:
-    mses, psnrs, ssims = [], [], []
-    for inputs, targets in loader:
-        for pred, target in zip(inputs, targets):
-            pred_np = pred.numpy().transpose(1, 2, 0)
-            target_np = target.numpy().transpose(1, 2, 0)
-            mse = float(np.mean((pred_np - target_np) ** 2))
-            mses.append(mse)
-            psnrs.append(float(20 * math.log10(1.0 / math.sqrt(max(mse, 1e-12)))))
-            ssims.append(float(structural_similarity(target_np, pred_np, data_range=1.0, channel_axis=2)))
-    return {"mse": float(np.mean(mses)), "psnr": float(np.mean(psnrs)), "ssim": float(np.mean(ssims))}
 
 
 def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
@@ -575,22 +471,19 @@ def save_segmentation_examples(models: dict[str, nn.Module], dataset: Dataset, d
     plt.close(fig)
 
 
-def save_restoration_examples(models: dict[str, nn.Module], dataset: Dataset, device: torch.device, out_path: Path, count: int = 3) -> None:
-    fig, axes = plt.subplots(count, 4, figsize=(10, 2.8 * count))
+def save_visual_restoration_examples(dataset: VisualRestorationDataset, out_path: Path, count: int = 3) -> None:
+    count = min(count, len(dataset))
+    fig, axes = plt.subplots(count, 2, figsize=(7, 3.0 * count))
+    if count == 1:
+        axes = np.expand_dims(axes, axis=0)
     indices = np.linspace(0, len(dataset) - 1, count, dtype=int)
     for row, idx in enumerate(indices):
-        degraded, clean = dataset[int(idx)]
-        with torch.no_grad():
-            preds = {name: predict_restoration(model, degraded.unsqueeze(0).to(device)).squeeze(0).cpu() for name, model in models.items()}
-        axes[row, 0].imshow(tensor_to_image(degraded))
-        axes[row, 0].set_title("Degraded")
-        axes[row, 1].imshow(tensor_to_image(clean))
-        axes[row, 1].set_title("Ground Truth")
-        axes[row, 2].imshow(tensor_to_image(preds["Restoration U-Net"]))
-        axes[row, 2].set_title("Restoration U-Net")
-        axes[row, 3].imshow(tensor_to_image(preds["Plain CNN"]))
-        axes[row, 3].set_title("Plain CNN")
-        for col in range(4):
+        original, enhanced = dataset[int(idx)]
+        axes[row, 0].imshow(original)
+        axes[row, 0].set_title("Original")
+        axes[row, 1].imshow(enhanced)
+        axes[row, 1].set_title("Enhanced result")
+        for col in range(2):
             axes[row, col].axis("off")
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
@@ -612,7 +505,7 @@ def save_history_plot(histories: dict[str, list[dict[str, float]]], out_path: Pa
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="CamVid road-scene segmentation and restoration experiments")
+    parser = argparse.ArgumentParser(description="CamVid road-scene segmentation and visual image enhancement experiments")
     parser.add_argument("--seg-dataset", choices=["camvid_tiny", "camvid", "synthetic"], default="camvid_tiny")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
@@ -620,8 +513,6 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=96)
     parser.add_argument("--train-count", type=int, default=80)
     parser.add_argument("--val-count", type=int, default=20)
-    parser.add_argument("--restore-train-count", type=int, default=96)
-    parser.add_argument("--restore-val-count", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--img-dir", type=Path, default=Path("img"))
@@ -653,13 +544,10 @@ def main() -> None:
             seg_val = RoadSegmentationDataset(args.val_count, args.size, 10_000)
             segmentation_source_type = "generated_road_scenes_fallback"
 
-    restore_train = RoadRestorationDataset(args.restore_train_count, args.size, 20_000, args.img_dir, restoration_fallback_sources)
-    restore_val = RoadRestorationDataset(args.restore_val_count, args.size, 30_000, args.img_dir, restoration_fallback_sources)
+    visual_restore = VisualRestorationDataset(args.size, args.img_dir, restoration_fallback_sources)
 
     seg_train_loader = DataLoader(seg_train, batch_size=args.batch_size, shuffle=True)
     seg_val_loader = DataLoader(seg_val, batch_size=args.batch_size)
-    restore_train_loader = DataLoader(restore_train, batch_size=args.batch_size, shuffle=True)
-    restore_val_loader = DataLoader(restore_val, batch_size=args.batch_size)
     class_weights = compute_class_weights(seg_train, device)
 
     results: dict[str, object] = {
@@ -671,13 +559,17 @@ def main() -> None:
             "segmentation_dataset": args.seg_dataset,
             "segmentation_source_type": segmentation_source_type,
             "camvid_root": str(camvid_root) if camvid_root else None,
-            "restoration_source_images": restore_train.source_count,
-            "restoration_source_type": restore_train.source_type,
+            "restoration_mode": "visual_only_no_reference",
+            "restoration_source_images": visual_restore.source_count,
+            "restoration_source_type": visual_restore.source_type,
             "classes": CLASS_NAMES,
             "segmentation_class_weights": {name: float(class_weights[idx].cpu()) for idx, name in enumerate(CLASS_NAMES)},
         },
         "segmentation": {},
-        "restoration": {"Degraded input": evaluate_restoration_input(restore_val_loader)},
+        "restoration": {
+            "mode": "visual_only_no_reference",
+            "note": "The img samples have no high-resolution ground truth, so no artificial degradation or full-reference metrics are used.",
+        },
     }
 
     seg_models = {"U-Net": UNetSmall(out_channels=len(CLASS_NAMES)), "FCN": FCNSmall(out_channels=len(CLASS_NAMES))}
@@ -690,20 +582,12 @@ def main() -> None:
             "history": history,
         }
 
-    restore_models = {"Restoration U-Net": RestorationUNet(), "Plain CNN": PlainRestorationCNN()}
-    restore_histories = {}
-    for name, model in restore_models.items():
-        history = train_restoration(model, restore_train_loader, restore_val_loader, max(30, args.epochs), device)
-        restore_histories[name] = history
-        results["restoration"][name] = evaluate_restoration(model, restore_val_loader, device) | {
-            "parameters": count_parameters(model),
-            "history": history,
-        }
-
     save_segmentation_examples(seg_models, seg_val, device, figures_dir / "segmentation_examples.png")
-    save_restoration_examples(restore_models, restore_val, device, figures_dir / "restoration_examples.png")
+    save_visual_restoration_examples(visual_restore, figures_dir / "restoration_examples.png")
     save_history_plot(seg_histories, figures_dir / "segmentation_loss.png", "Road Segmentation Validation Loss")
-    save_history_plot(restore_histories, figures_dir / "restoration_loss.png", "Restoration Validation Loss")
+    stale_restoration_loss = figures_dir / "restoration_loss.png"
+    if stale_restoration_loss.exists():
+        stale_restoration_loss.unlink()
 
     with (args.output_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)

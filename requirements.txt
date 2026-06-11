@@ -3,5 +3,4 @@ torchvision
 numpy
 Pillow
 matplotlib
-scikit-image
 tqdm
