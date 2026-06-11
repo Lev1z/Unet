@@ -3,6 +3,8 @@ import copy
 import json
 import math
 import random
+import tarfile
+import urllib.request
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -26,6 +28,28 @@ CLASS_COLORS = np.array(
     dtype=np.uint8,
 )
 
+CAMVID_URLS = {
+    "camvid_tiny": "https://s3.amazonaws.com/fast-ai-sample/camvid_tiny.tgz",
+    "camvid": "https://s3.amazonaws.com/fast-ai-imagelocal/camvid.tgz",
+}
+
+CAMVID_ROAD_CLASSES = {"Road", "RoadShoulder", "Sidewalk", "LaneMkgsDriv", "LaneMkgsNonDriv"}
+CAMVID_VEHICLE_CLASSES = {"Car", "SUVPickupTruck", "Truck_Bus", "Train", "MotorcycleScooter"}
+CAMVID_OBSTACLE_CLASSES = {
+    "Animal",
+    "Bicyclist",
+    "CartLuggagePram",
+    "Child",
+    "Column_Pole",
+    "Fence",
+    "OtherMoving",
+    "ParkingBlock",
+    "Pedestrian",
+    "SignSymbol",
+    "TrafficCone",
+    "TrafficLight",
+}
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -40,6 +64,115 @@ def np_to_tensor(image: np.ndarray) -> torch.Tensor:
 
 def mask_to_rgb(mask: np.ndarray) -> np.ndarray:
     return CLASS_COLORS[mask]
+
+
+def safe_extract_tar(archive_path: Path, destination: Path) -> None:
+    destination = destination.resolve()
+    with tarfile.open(archive_path) as tar:
+        for member in tar.getmembers():
+            target = (destination / member.name).resolve()
+            if destination not in target.parents and target != destination:
+                raise RuntimeError(f"Refusing to extract unsafe path: {member.name}")
+        tar.extractall(destination)
+
+
+def find_camvid_root(search_root: Path) -> Path:
+    candidates = []
+    for path in search_root.rglob("*"):
+        if not path.is_dir():
+            continue
+        if (path / "images").is_dir() and (path / "labels").is_dir() and (path / "codes.txt").is_file():
+            candidates.append(path)
+    if not candidates:
+        raise FileNotFoundError(f"Could not find CamVid images/labels/codes.txt under {search_root}")
+    return sorted(candidates, key=lambda p: len(p.parts))[0]
+
+
+def prepare_camvid_dataset(dataset_name: str, data_dir: Path, download: bool) -> Path:
+    dataset_dir = data_dir / dataset_name
+    try:
+        return find_camvid_root(dataset_dir)
+    except FileNotFoundError:
+        pass
+    if not download:
+        raise FileNotFoundError(f"{dataset_name} is not available under {dataset_dir}; rerun with --download")
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = data_dir / f"{dataset_name}.tgz"
+    if not archive_path.exists():
+        print(f"Downloading {dataset_name} from {CAMVID_URLS[dataset_name]}")
+        urllib.request.urlretrieve(CAMVID_URLS[dataset_name], archive_path)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    safe_extract_tar(archive_path, dataset_dir)
+    return find_camvid_root(dataset_dir)
+
+
+def load_camvid_mapping(codes_path: Path) -> np.ndarray:
+    codes = [line.strip() for line in codes_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    mapping = np.zeros(len(codes), dtype=np.uint8)
+    for idx, name in enumerate(codes):
+        if name in CAMVID_ROAD_CLASSES:
+            mapping[idx] = 1
+        elif name in CAMVID_VEHICLE_CLASSES:
+            mapping[idx] = 2
+        elif name in CAMVID_OBSTACLE_CLASSES:
+            mapping[idx] = 3
+    return mapping
+
+
+def pair_camvid_files(root: Path) -> list[tuple[Path, Path]]:
+    image_paths = sorted((root / "images").glob("*.png"))
+    pairs = []
+    for image_path in image_paths:
+        label_path = root / "labels" / f"{image_path.stem}_P.png"
+        if label_path.exists():
+            pairs.append((image_path, label_path))
+    if not pairs:
+        raise FileNotFoundError(f"No CamVid image/label pairs found under {root}")
+    return pairs
+
+
+def select_pairs(pairs: list[tuple[Path, Path]], count: int, split: str, seed: int) -> list[tuple[Path, Path]]:
+    rng = random.Random(seed)
+    shuffled = pairs.copy()
+    rng.shuffle(shuffled)
+    val_count = max(1, min(len(shuffled) // 5, 128))
+    if split == "val":
+        base = shuffled[:val_count]
+    else:
+        base = shuffled[val_count:] or shuffled
+    if count <= len(base):
+        return base[:count]
+    return [base[idx % len(base)] for idx in range(count)]
+
+
+class CamVidSegmentationDataset(Dataset):
+    def __init__(self, root: Path, count: int, size: int, split: str, seed: int):
+        self.samples = []
+        self.root = root
+        mapping = load_camvid_mapping(root / "codes.txt")
+        pairs = select_pairs(pair_camvid_files(root), count, split, seed)
+        for image_path, label_path in pairs:
+            image = Image.open(image_path).convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
+            label = Image.open(label_path).resize((size, size), Image.Resampling.NEAREST)
+            label_np = np.asarray(label, dtype=np.int64)
+            label_np = np.where(label_np < len(mapping), mapping[label_np], 0).astype(np.int64)
+            image_np = np.asarray(image).astype(np.float32) / 255.0
+            self.samples.append((np_to_tensor(image_np), torch.from_numpy(label_np).long()))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.samples[idx]
+
+
+def load_camvid_sources(root: Path, size: int, limit: int = 3) -> list[np.ndarray]:
+    sources = []
+    for image_path, _ in pair_camvid_files(root)[:limit]:
+        image = Image.open(image_path).convert("RGB").resize((size, size), Image.Resampling.BILINEAR)
+        sources.append(np.asarray(image).astype(np.float32) / 255.0)
+    return sources
 
 
 def draw_road_scene(seed: int, size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -143,11 +276,14 @@ class RoadSegmentationDataset(Dataset):
 
 
 class RoadRestorationDataset(Dataset):
-    def __init__(self, count: int, size: int, seed_offset: int, img_dir: Path):
+    def __init__(self, count: int, size: int, seed_offset: int, img_dir: Path, fallback_sources: list[np.ndarray] | None = None):
         self.samples = []
         sources = load_img_sources(img_dir, size)
-        self.source_type = "img" if sources else "generated_road_placeholder"
+        self.source_type = "img" if sources else "camvid_images"
+        if not sources and fallback_sources:
+            sources = fallback_sources
         if not sources:
+            self.source_type = "generated_road_placeholder"
             sources = [draw_road_scene(90_000 + idx, size)[0] for idx in range(3)]
         for idx in range(count):
             clean = sources[idx % len(sources)].copy()
@@ -273,10 +409,28 @@ def count_parameters(model: nn.Module) -> int:
     return sum(param.numel() for param in model.parameters() if param.requires_grad)
 
 
-def train_segmentation(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, epochs: int, device: torch.device) -> list[dict[str, float]]:
+def compute_class_weights(dataset: Dataset, device: torch.device) -> torch.Tensor:
+    counts = np.zeros(len(CLASS_NAMES), dtype=np.float64)
+    for _, mask in dataset:
+        counts += np.bincount(mask.numpy().ravel(), minlength=len(CLASS_NAMES))
+    frequencies = counts / max(1.0, counts.sum())
+    weights = 1.0 / np.sqrt(frequencies + 1e-6)
+    weights = weights / weights.mean()
+    weights = np.clip(weights, 0.35, 5.0)
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
+def train_segmentation(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    epochs: int,
+    device: torch.device,
+    class_weights: torch.Tensor,
+) -> list[dict[str, float]]:
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     history = []
     best_state = copy.deepcopy(model.state_dict())
     best_val_loss = float("inf")
@@ -458,17 +612,20 @@ def save_history_plot(histories: dict[str, list[dict[str, float]]], out_path: Pa
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Road-scene segmentation and restoration experiments")
+    parser = argparse.ArgumentParser(description="CamVid road-scene segmentation and restoration experiments")
+    parser.add_argument("--seg-dataset", choices=["camvid_tiny", "camvid", "synthetic"], default="camvid_tiny")
+    parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--size", type=int, default=96)
-    parser.add_argument("--train-count", type=int, default=768)
-    parser.add_argument("--val-count", type=int, default=192)
+    parser.add_argument("--train-count", type=int, default=80)
+    parser.add_argument("--val-count", type=int, default=20)
     parser.add_argument("--restore-train-count", type=int, default=96)
     parser.add_argument("--restore-val-count", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--img-dir", type=Path, default=Path("img"))
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs_road"))
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs_camvid"))
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -477,24 +634,47 @@ def main() -> None:
     figures_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    seg_train = RoadSegmentationDataset(args.train_count, args.size, 0)
-    seg_val = RoadSegmentationDataset(args.val_count, args.size, 10_000)
-    restore_train = RoadRestorationDataset(args.restore_train_count, args.size, 20_000, args.img_dir)
-    restore_val = RoadRestorationDataset(args.restore_val_count, args.size, 30_000, args.img_dir)
+    camvid_root = None
+    restoration_fallback_sources = None
+    if args.seg_dataset == "synthetic":
+        seg_train = RoadSegmentationDataset(args.train_count, args.size, 0)
+        seg_val = RoadSegmentationDataset(args.val_count, args.size, 10_000)
+        segmentation_source_type = "generated_road_scenes"
+    else:
+        try:
+            camvid_root = prepare_camvid_dataset(args.seg_dataset, args.data_dir, args.download)
+            seg_train = CamVidSegmentationDataset(camvid_root, args.train_count, args.size, "train", args.seed)
+            seg_val = CamVidSegmentationDataset(camvid_root, args.val_count, args.size, "val", args.seed)
+            restoration_fallback_sources = load_camvid_sources(camvid_root, args.size)
+            segmentation_source_type = str(camvid_root)
+        except Exception as exc:
+            print(f"CamVid loading failed ({exc}); falling back to generated road scenes.")
+            seg_train = RoadSegmentationDataset(args.train_count, args.size, 0)
+            seg_val = RoadSegmentationDataset(args.val_count, args.size, 10_000)
+            segmentation_source_type = "generated_road_scenes_fallback"
+
+    restore_train = RoadRestorationDataset(args.restore_train_count, args.size, 20_000, args.img_dir, restoration_fallback_sources)
+    restore_val = RoadRestorationDataset(args.restore_val_count, args.size, 30_000, args.img_dir, restoration_fallback_sources)
 
     seg_train_loader = DataLoader(seg_train, batch_size=args.batch_size, shuffle=True)
     seg_val_loader = DataLoader(seg_val, batch_size=args.batch_size)
     restore_train_loader = DataLoader(restore_train, batch_size=args.batch_size, shuffle=True)
     restore_val_loader = DataLoader(restore_val, batch_size=args.batch_size)
+    class_weights = compute_class_weights(seg_train, device)
 
     results: dict[str, object] = {
         "config": vars(args) | {
+            "data_dir": str(args.data_dir),
             "img_dir": str(args.img_dir),
             "output_dir": str(args.output_dir),
             "device": str(device),
+            "segmentation_dataset": args.seg_dataset,
+            "segmentation_source_type": segmentation_source_type,
+            "camvid_root": str(camvid_root) if camvid_root else None,
             "restoration_source_images": restore_train.source_count,
             "restoration_source_type": restore_train.source_type,
             "classes": CLASS_NAMES,
+            "segmentation_class_weights": {name: float(class_weights[idx].cpu()) for idx, name in enumerate(CLASS_NAMES)},
         },
         "segmentation": {},
         "restoration": {"Degraded input": evaluate_restoration_input(restore_val_loader)},
@@ -503,7 +683,7 @@ def main() -> None:
     seg_models = {"U-Net": UNetSmall(out_channels=len(CLASS_NAMES)), "FCN": FCNSmall(out_channels=len(CLASS_NAMES))}
     seg_histories = {}
     for name, model in seg_models.items():
-        history = train_segmentation(model, seg_train_loader, seg_val_loader, args.epochs, device)
+        history = train_segmentation(model, seg_train_loader, seg_val_loader, args.epochs, device, class_weights)
         seg_histories[name] = history
         results["segmentation"][name] = evaluate_segmentation(model, seg_val_loader, device) | {
             "parameters": count_parameters(model),
