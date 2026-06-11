@@ -6,7 +6,6 @@ venv/
 *.pth
 *.onnx
 data/
-img/
 outputs_pet_smoke/
 outputs_pet_large/
 .DS_Store
