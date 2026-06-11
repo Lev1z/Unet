@@ -61,7 +61,7 @@ python run_road_experiments.py --seg-dataset camvid --output-dir outputs_camvid_
 | `outputs_camvid/metrics.json` | 当前实验配置、指标、训练历史 |
 | `outputs_camvid/figures/segmentation_examples.png` | 分割结果对比图 |
 | `outputs_camvid/figures/restoration_examples.png` | 图像还原结果对比图 |
-| `img/` | 可放入 2-3 张自选图片用于还原实验；若为空，脚本使用 CamVid 图片 |
+| `img/` | 当前放入 `1.jpg`、`2.jpg`、`3.jpg`，用于清晰度还原实验 |
 
 ## 环境准备
 
@@ -105,17 +105,17 @@ outputs_camvid/figures/restoration_loss.png
 
 | 模型 | mIoU(all) | mIoU(foreground) | Pixel Accuracy | 参数量 |
 |---|---:|---:|---:|---:|
-| U-Net | 0.6569 | 0.5803 | 0.9126 | 117,732 |
-| FCN | 0.6128 | 0.5297 | 0.8946 | 35,894 |
+| U-Net | 0.6501 | 0.5842 | 0.8896 | 117,732 |
+| FCN | 0.6136 | 0.5355 | 0.8829 | 35,894 |
 
 ### 分割类别 IoU
 
 | 类别 | U-Net IoU | FCN IoU |
 |---|---:|---:|
-| background | 0.8866 | 0.8619 |
-| road | 0.9126 | 0.8916 |
-| vehicle | 0.6299 | 0.5335 |
-| obstacle | 0.1985 | 0.1642 |
+| background | 0.8476 | 0.8480 |
+| road | 0.9179 | 0.8886 |
+| vehicle | 0.6185 | 0.5233 |
+| obstacle | 0.2161 | 0.1946 |
 
 分割可视化：
 
@@ -131,9 +131,9 @@ outputs_camvid/figures/restoration_loss.png
 
 | 模型/输入 | MSE | PSNR | SSIM | 参数量 |
 |---|---:|---:|---:|---:|
-| Degraded input | 0.001038 | 29.9817 | 0.7965 | - |
-| Restoration U-Net | 0.000283 | 35.7171 | 0.9277 | 117,715 |
-| Plain CNN | 0.000894 | 30.5045 | 0.8872 | 20,259 |
+| Degraded input | 0.003953 | 24.5616 | 0.8627 | - |
+| Restoration U-Net | 0.000530 | 32.9873 | 0.9466 | 117,715 |
+| Plain CNN | 0.001796 | 27.7895 | 0.9300 | 20,259 |
 
 还原可视化：
 
@@ -143,7 +143,7 @@ outputs_camvid/figures/restoration_loss.png
 
 ![Restoration loss](outputs_camvid/figures/restoration_loss.png)
 
-结论：Restoration U-Net 在 MSE、PSNR、SSIM 上都优于退化输入和 Plain CNN。Plain CNN 倾向于输出更平滑的图像，U-Net 能保留更多结构并修正退化。
+当前清晰度还原使用 `img/1.jpg`、`img/2.jpg`、`img/3.jpg`。结论：Restoration U-Net 在 MSE、PSNR、SSIM 上都优于退化输入和 Plain CNN。Plain CNN 倾向于输出更平滑的图像，U-Net 能保留更多结构并修正退化。
 
 ## 汇报建议
 
