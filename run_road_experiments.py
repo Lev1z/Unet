@@ -285,13 +285,61 @@ class VisualRestorationDataset(Dataset):
 
 def enhance_for_visual_restoration(image: np.ndarray) -> np.ndarray:
     pil = Image.fromarray((image * 255).astype(np.uint8), mode="RGB")
-    pil = pil.resize((pil.width * 2, pil.height * 2), Image.Resampling.LANCZOS)
-    pil = ImageOps.autocontrast(pil, cutoff=1)
-    pil = pil.filter(ImageFilter.MedianFilter(size=3))
-    pil = ImageEnhance.Contrast(pil).enhance(1.18)
-    pil = pil.filter(ImageFilter.UnsharpMask(radius=1.1, percent=185, threshold=2))
-    pil = ImageEnhance.Sharpness(pil).enhance(1.25)
-    return np.asarray(pil).astype(np.float32) / 255.0
+    scale = 3 if max(pil.size) < 180 else 2
+    pil = pil.resize((pil.width * scale, pil.height * scale), Image.Resampling.LANCZOS)
+
+    gray = ImageOps.grayscale(pil)
+    gray = ImageOps.autocontrast(gray, cutoff=2)
+    gray = gray.filter(ImageFilter.MedianFilter(size=3))
+
+    arr = np.asarray(gray).astype(np.float32)
+    light_mask = arr > 168
+    mid_mask = (arr > 118) & (arr <= 168)
+    arr[light_mask] = 255
+    arr[mid_mask] = arr[mid_mask] + (255 - arr[mid_mask]) * 0.38
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    clean = Image.fromarray(arr, mode="L")
+    clean = clean.filter(ImageFilter.MaxFilter(size=3))
+    clean = clean.filter(ImageFilter.MinFilter(size=3))
+    clean = clean.filter(ImageFilter.ModeFilter(size=3))
+    clean = clean.filter(ImageFilter.MedianFilter(size=3))
+    clean = Image.fromarray(remove_small_dark_components(np.asarray(clean), min_area=95, threshold=190), mode="L")
+    clean = clean.filter(ImageFilter.UnsharpMask(radius=0.9, percent=125, threshold=5))
+    clean = ImageEnhance.Contrast(clean).enhance(1.08)
+    return np.asarray(clean.convert("RGB")).astype(np.float32) / 255.0
+
+
+def remove_small_dark_components(image: np.ndarray, min_area: int, threshold: int = 95) -> np.ndarray:
+    dark = image < threshold
+    visited = np.zeros(dark.shape, dtype=bool)
+    cleaned = image.copy()
+    height, width = dark.shape
+    neighbors = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+
+    for y in range(height):
+        for x in range(width):
+            if visited[y, x] or not dark[y, x]:
+                continue
+            stack = [(y, x)]
+            component = []
+            visited[y, x] = True
+            while stack:
+                cy, cx = stack.pop()
+                component.append((cy, cx))
+                for dy, dx in neighbors:
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < height and 0 <= nx < width and not visited[ny, nx] and dark[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+            ys = [point[0] for point in component]
+            xs = [point[1] for point in component]
+            span_y = max(ys) - min(ys) + 1
+            span_x = max(xs) - min(xs) + 1
+            if len(component) < min_area or (span_y <= 22 and span_x <= 22):
+                for cy, cx in component:
+                    cleaned[cy, cx] = 255
+    return cleaned
 
 
 def load_img_sources(img_dir: Path, size: int) -> list[np.ndarray]:
@@ -301,7 +349,10 @@ def load_img_sources(img_dir: Path, size: int) -> list[np.ndarray]:
     for path in sorted(img_dir.iterdir()):
         if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
             continue
-        image = Image.open(path).convert("RGB").resize((size, size), Image.Resampling.LANCZOS)
+        image = Image.open(path).convert("RGB")
+        if max(image.size) < size:
+            scale = int(np.ceil(size / max(image.size)))
+            image = image.resize((image.width * scale, image.height * scale), Image.Resampling.LANCZOS)
         images.append(np.asarray(image).astype(np.float32) / 255.0)
     return images[:3]
 
